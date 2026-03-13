@@ -49,6 +49,50 @@ function detectPlatform(url) {
   return null;
 }
 
+// Send Webhook to OpenClaw Gateway with retry (1s, 3s, 10s)
+async function sendWebhook(env, jobId, sourceUrl, createdBy, createdAt) {
+  const gatewayUrl = env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789/hooks/recipe-job';
+  const token = env.OPENCLAW_GATEWAY_TOKEN;
+  if (!token) {
+    console.error('Webhook: OPENCLAW_GATEWAY_TOKEN not set');
+    return;
+  }
+
+  const payload = JSON.stringify({
+    event: 'recipe.job.created',
+    job_id: jobId,
+    source_url: sourceUrl,
+    created_by: createdBy || 'website',
+    created_at: createdAt,
+    idempotency_key: String(jobId),
+  });
+
+  const delays = [0, 1000, 3000, 10000]; // immediate + 3 retries
+  for (let attempt = 0; attempt < delays.length; attempt++) {
+    if (delays[attempt] > 0) {
+      await new Promise(r => setTimeout(r, delays[attempt]));
+    }
+    try {
+      const res = await fetch(gatewayUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: payload,
+      });
+      if (res.ok) {
+        console.log(`Webhook sent OK — job_id=${jobId} attempt=${attempt + 1}`);
+        return; // success
+      }
+      console.warn(`Webhook attempt ${attempt + 1} failed — status=${res.status} job_id=${jobId}`);
+    } catch (e) {
+      console.warn(`Webhook attempt ${attempt + 1} error — job_id=${jobId}: ${e.message}`);
+    }
+  }
+  console.error(`Webhook failed after all retries — job_id=${jobId} url=${sourceUrl}`);
+}
+
 function isValidUrl(url) {
   try {
     const u = new URL(url);
@@ -239,7 +283,12 @@ export default {
         VALUES (?, 'pending', ?, ?, ?)
       `).bind(source_url, created_by || null, ts, ts).run();
 
-      return json({ success: true, job_id: result.meta.last_row_id, status: 'pending' }, 200);
+      const newJobId = result.meta.last_row_id;
+
+      // Send immediate Webhook to OpenClaw Gateway (non-blocking, with retry)
+      ctx.waitUntil(sendWebhook(env, newJobId, source_url, created_by, ts));
+
+      return json({ success: true, job_id: newJobId, status: 'pending' }, 200);
     }
 
     // ─────────────────────────────────────────────
